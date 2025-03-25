@@ -1,0 +1,507 @@
+'use client';
+import React, { useState, useCallback, useEffect, useRef, Suspense } from 'react';
+import { useToast } from './context/ToastContext';
+import LoadingScreen from './components/LoadingScreen';
+import { useSearchParams } from 'next/navigation'; 
+import { startCall, endCall } from '@/lib/callFunctions'
+import { CallConfig, SelectedTool, JobProfileData } from '@/lib/types'
+import demoConfig from './demo-config';
+import { Role, Transcript, UltravoxSessionStatus } from 'ultravox-client';
+import CallStatus from './components/CallStatus';
+import MicToggleButton from './components/MicToggleButton';
+import { PhoneOffIcon, Briefcase, Code, MapPin, Building, XCircle } from 'lucide-react';
+import JobProfile from './components/JobProfile';
+import ConversationSummary from './components/ConversationSummary';
+import BackgroundAnimation from './components/BackgroundAnimation';
+import GradientText from './components/GradientText';
+import { JobMatch } from './types/perplexity';
+import JobSearchResults from './components/JobSearchResults';
+
+type SearchParamsProps = {
+  showMuteSpeakerButton: boolean;
+  modelOverride: string | undefined;
+  showUserTranscripts: boolean;
+};
+
+type SearchParamsHandlerProps = {
+  children: (props: SearchParamsProps) => React.ReactNode;
+};
+
+function SearchParamsHandler({ children }: SearchParamsHandlerProps) {
+  const searchParams = useSearchParams();
+  const showMuteSpeakerButton = searchParams?.get('showSpeakerMute') === 'true';
+  const showUserTranscripts = searchParams?.get('showUserTranscripts') === 'true';
+  let modelOverride: string | undefined;
+  
+  const model = searchParams?.get('model');
+  if (model) {
+    modelOverride = "fixie-ai/" + model;
+  }
+  
+  return children({ 
+    showMuteSpeakerButton: showMuteSpeakerButton || false,
+    modelOverride,
+    showUserTranscripts: showUserTranscripts || false
+  });
+}
+
+export default function Home() {
+  const { showToast } = useToast();
+  const [isCallActive, setIsCallActive] = useState(false);
+  const [agentStatus, setAgentStatus] = useState<string>('off');
+  const [callTranscript, setCallTranscript] = useState<Transcript[] | null>([]);
+  const [customerProfileKey, setCustomerProfileKey] = useState<string | null>(null);
+  const [showSummary, setShowSummary] = useState(false);
+  const [latestProfile, setLatestProfile] = useState<JobProfileData | null>(null);
+  const transcriptContainerRef = useRef<HTMLDivElement>(null);
+  const [showFloatingButton, setShowFloatingButton] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
+  const [isEndingCall, setIsEndingCall] = useState(false);
+  
+  // Job search related states
+  const [isSearchingJobs, setIsSearchingJobs] = useState(false);
+  const [jobResults, setJobResults] = useState<JobMatch[]>([]);
+  const [jobSearchError, setJobSearchError] = useState<string | undefined>();
+
+  useEffect(() => {
+    if (transcriptContainerRef.current) {
+      transcriptContainerRef.current.scrollTop = transcriptContainerRef.current.scrollHeight;
+    }
+  }, [callTranscript]);
+
+  useEffect(() => {
+    const handleScroll = () => {
+      const scrollY = window.scrollY;
+      setShowFloatingButton(scrollY > 200);
+    };
+
+    window.addEventListener('scroll', handleScroll);
+    return () => window.removeEventListener('scroll', handleScroll);
+  }, []);
+
+  const handleStatusChange = useCallback((status: UltravoxSessionStatus | string | undefined) => {
+    if(status) {
+      setAgentStatus(status);
+    } else {
+      setAgentStatus('off');
+    }
+  }, []);
+
+  const handleTranscriptChange = useCallback((transcripts: Transcript[] | undefined) => {
+    if(transcripts) {
+      setCallTranscript([...transcripts]);
+    }
+  }, []);
+
+  const clearCustomerProfile = useCallback(() => {
+    setCustomerProfileKey(prev => prev ? `${prev}-cleared` : 'cleared');
+  }, []);
+
+  const handleStartCallButtonClick = async (modelOverride?: string) => {
+    try {
+      handleStatusChange('Starting call...');
+      setCallTranscript(null);
+      clearCustomerProfile();
+      const newKey = `call-${Date.now()}`;
+      setCustomerProfileKey(newKey);
+      let callConfig: CallConfig = {
+        systemPrompt: demoConfig.callConfig.systemPrompt,
+        model: modelOverride || demoConfig.callConfig.model,
+        languageHint: demoConfig.callConfig.languageHint,
+        voice: demoConfig.callConfig.voice,
+        temperature: demoConfig.callConfig.temperature,
+        maxDuration: demoConfig.callConfig.maxDuration,
+        timeExceededMessage: demoConfig.callConfig.timeExceededMessage
+      };
+      const paramOverride: { [key: string]: any } = {
+        "callId": newKey
+      }
+      let cpTool: SelectedTool | undefined = demoConfig?.callConfig?.selectedTools?.find(tool => tool.toolName === "updateJobProfile");
+      
+      if (cpTool) {
+        cpTool.parameterOverrides = paramOverride;
+      }
+      callConfig.selectedTools = demoConfig.callConfig.selectedTools;
+      await startCall({
+        onStatusChange: handleStatusChange,
+        onTranscriptChange: handleTranscriptChange
+      }, callConfig);
+      setIsCallActive(true);
+      setIsEndingCall(false);
+      handleStatusChange('Call started successfully');
+      showToast('Career conversation started successfully', 'success');
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      handleStatusChange(`Error starting call: ${errorMessage}`);
+      showToast(`Failed to start conversation: ${errorMessage}`, 'error');
+    }
+  };
+
+  const handleEndCallButtonClick = async () => {
+    try {
+      setIsEndingCall(true);
+      handleStatusChange('Ending call...');
+      await endCall();
+      setIsCallActive(false);
+      handleStatusChange('Call ended successfully');
+      setShowSummary(true);
+      showToast('Career conversation completed! Showing summary...', 'success');
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      handleStatusChange(`Error ending call: ${errorMessage}`);
+      showToast(`Failed to end conversation: ${errorMessage}`, 'error');
+      setIsEndingCall(false);
+    }
+  };
+
+  const handleSearchJobs = async () => {
+    if (!latestProfile || isSearchingJobs) return;
+
+    setIsSearchingJobs(true);
+    setJobSearchError(undefined);
+
+    try {
+      // Check if essential profile fields are available
+      const { profile } = latestProfile;
+      
+      // Define the minimum required fields
+      if (!profile) {
+        throw new Error('Profile information is missing. Please complete your career conversation first.');
+      }
+      
+      // Check for essential fields
+      const missingFields = [];
+      if (!profile.desiredRole && !profile.currentRole) missingFields.push('desired role');
+      if (!profile.preferredIndustry) missingFields.push('industry preference');
+      if (!profile.programmingLanguages && !profile.frameworks && !profile.tools) missingFields.push('skills');
+      
+      // If essential fields are missing, throw a custom error
+      if (missingFields.length > 0) {
+        const formattedMissing = missingFields.join(', ');
+        throw new Error(`Profile information is incomplete: missing ${formattedMissing}. Please continue your career conversation to provide all details.`);
+      }
+
+      // Map the profile data to the expected JobProfileItem format
+      const jobProfileItem = {
+        skills: [
+          profile.programmingLanguages,
+          profile.frameworks,
+          profile.tools
+        ].filter(Boolean).join(',').split(',').map(s => s.trim()).filter(Boolean),
+        experience: profile.experienceLevel || '',
+        yearsOfExperience: profile.yearsOfExperience?.toString() || '',
+        preferredIndustries: profile.preferredIndustry ? [profile.preferredIndustry] : [],
+        preferredRoles: [profile.desiredRole, profile.currentRole].filter(Boolean),
+        locationPreference: profile.location || '',
+        employmentTypes: [],
+        remotePreference: profile.remotePreference || '',
+        salaryRange: {
+          min: 0,
+          max: 0,
+          currency: 'USD'
+        },
+        targetRoles: [profile.desiredRole].filter(Boolean),
+        suggestedRoles: [],
+        currentStatus: '',
+        additionalNotes: '',
+        techStack: []
+      };
+
+      const response = await fetch('/api/jobs/search', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(jobProfileItem),
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.error || 'Unable to find matching jobs at the moment.');
+      }
+
+      const data = await response.json();
+      
+      if (!data.success) {
+        throw new Error(data.error || 'Failed to find matching jobs.');
+      }
+
+      setJobResults(data.jobs || []);
+      
+      if (data.jobs && data.jobs.length > 0) {
+        showToast(`Found ${data.jobs.length} matching job opportunities!`, 'success');
+      } else {
+        showToast('No matching jobs found. Try updating your profile.', 'info');
+      }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Failed to find matching jobs';
+      setJobSearchError(errorMessage);
+      showToast(errorMessage, 'error');
+      console.error('Job search error:', error);
+    } finally {
+      setIsSearchingJobs(false);
+    }
+  };
+
+  const startCallWithLoading = async (modelOverride?: string) => {
+    setIsLoading(true);
+    try {
+      await handleStartCallButtonClick(modelOverride);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    const handleProfileUpdate = (event: CustomEvent<string>) => {
+      try {
+        const parsedData = JSON.parse(event.detail);
+        const updatedProfile = {
+          profile: {
+            ...(latestProfile?.profile || {}),
+            ...parsedData
+          }
+        };
+        
+        setLatestProfile(updatedProfile);
+        // Removed the recursive event dispatch that was causing infinite loop
+      } catch (error) {
+        console.error('Error parsing profile data:', error);
+        showToast('Error updating profile', 'error');
+      }
+    };
+
+    window.addEventListener('jobProfileUpdated', handleProfileUpdate as EventListener);
+    return () => {
+      window.removeEventListener('jobProfileUpdated', handleProfileUpdate as EventListener);
+    };
+  }, [showToast, latestProfile]);
+
+  // Add effect to check if call is suddenly disconnected
+  useEffect(() => {
+    if (agentStatus === 'off' && isCallActive && !isEndingCall) {
+      setIsCallActive(false);
+      showToast('Call disconnected unexpectedly. Your profile has been saved.', 'warning');
+    }
+  }, [agentStatus, isCallActive, isEndingCall, showToast]);
+
+  return (
+    <>
+      <BackgroundAnimation 
+        variant={
+          isCallActive ? 'active' : 
+          isLoading ? 'subtle' : 
+          'default'
+        } 
+      />
+      <Suspense fallback={<LoadingScreen message="Loading JobeasyO..." />}>
+      {isLoading && <LoadingScreen message="Initializing voice interaction..." />}
+      <SearchParamsHandler>
+        {({ showMuteSpeakerButton, modelOverride, showUserTranscripts }: SearchParamsProps) => (
+          <>
+            {!isCallActive && showFloatingButton && (
+              <button
+                type="button"
+                className="fixed bottom-4 right-4 md:bottom-8 md:right-8 z-50 animate-bounce hover:animate-none hover:bg-blue-700 bg-blue-600 px-4 py-3 md:px-6 md:py-4 text-base md:text-lg font-bold rounded-full shadow-xl hover:shadow-2xl transition-all duration-300 flex items-center space-x-2"
+                onClick={() => startCallWithLoading(modelOverride)}
+              >
+                <span>Start Career Conversation</span>
+                <svg className="w-5 h-5 md:w-6 md:h-6 ml-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                </svg>
+              </button>
+            )}
+            
+            <div className="flex flex-col items-center justify-center min-h-[calc(100vh-100px)]">
+              <div className="max-w-[1206px] w-full mx-auto px-4 py-4 md:py-5 md:pl-5 md:pr-[10px] border border-[#2A2A2A] rounded-[3px]">
+                <div className="flex flex-col justify-center lg:flex-row">
+                  <div className="w-full lg:w-2/3 mb-6 lg:mb-0">
+                    <div className="flex flex-col justify-between items-center h-full font-mono p-2 md:p-4">
+                      {isCallActive ? (
+                        <div className="w-full">
+                          <div className="mb-5 relative">
+                            <div 
+                              ref={transcriptContainerRef}
+                              className="h-[300px] md:h-[400px] p-3 md:p-4 overflow-y-auto relative bg-gray-900/95 backdrop-blur border border-gray-800 rounded-lg scrollbar-visible"
+                            >
+                              {callTranscript && callTranscript.map((transcript, index) => (
+                                <div 
+                                  key={index} 
+                                  className={`mb-4 p-2 md:p-3 rounded-lg transition-all duration-300 ${
+                                    transcript.speaker === 'agent' 
+                                      ? 'bg-blue-900/20 border border-blue-800/30' 
+                                      : showUserTranscripts ? 'bg-gray-800/50 border border-gray-700/30' : 'hidden'
+                                  }`}
+                                >
+                                  <div className="flex items-center mb-2">
+                                    {transcript.speaker === 'agent' ? (
+                                      <>
+                                        <Briefcase size={16} className="text-blue-400 mr-2" />
+                                        <span className="text-blue-400 font-medium">JobeasyO Assistant</span>
+                                      </>
+                                    ) : (
+                                      <>
+                                        <MapPin size={16} className="text-gray-400 mr-2" />
+                                        <span className="text-gray-400 font-medium">You</span>
+                                      </>
+                                    )}
+                                  </div>
+                                  <p className={`${
+                                    transcript.speaker === 'agent' 
+                                      ? 'text-blue-100' 
+                                      : 'text-gray-300'
+                                  } leading-relaxed text-sm md:text-base`}>
+                                    {transcript.text}
+                                  </p>
+                                </div>
+                              ))}
+                            </div>
+                            <div className="absolute inset-x-0 top-0 h-20 bg-gradient-to-t from-transparent to-gray-900/95 pointer-events-none rounded-t-lg" />
+                            <div className="absolute inset-x-0 bottom-0 h-20 bg-gradient-to-b from-transparent to-gray-900/95 pointer-events-none rounded-b-lg" />
+                          </div>
+                          <div className="flex flex-wrap md:flex-nowrap justify-between gap-2 md:space-x-4 p-3 md:p-4 w-full bg-gray-900/95 backdrop-blur border border-gray-800 rounded-lg mt-4">
+                            <MicToggleButton role={Role.USER}/>
+                            { showMuteSpeakerButton && <MicToggleButton role={Role.AGENT}/> }
+                            <button
+                              type="button"
+                              className="flex-grow flex items-center justify-center h-10 bg-red-500/90 hover:bg-red-600/90 rounded-md transition-colors duration-300"
+                              onClick={handleEndCallButtonClick}
+                              disabled={!isCallActive || isEndingCall}
+                            >
+                              <PhoneOffIcon width={20} className="brightness-0 invert" />
+                              <span className="ml-2">End Conversation</span>
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="flex flex-col items-center justify-center w-full py-4 md:py-8">
+                          <div className="flex flex-col items-center justify-center mb-8 md:mb-12 text-center">
+                            <div className="relative mb-6 md:mb-8">
+                              <Briefcase size={80} className="md:text-6xl text-5xl text-blue-400" />
+                              <div className="absolute -top-2 -right-2 md:-top-4 md:-right-4 w-6 h-6 md:w-8 md:h-8 bg-green-500 rounded-full animate-ping" />
+                              <div className="absolute -top-2 -right-2 md:-top-4 md:-right-4 w-6 h-6 md:w-8 md:h-8 bg-green-500 rounded-full" />
+                            </div>
+                            <h2 className="text-3xl md:text-4xl font-bold mb-3 md:mb-4">
+                              <GradientText animate className="text-4xl md:text-5xl">JobeasyO</GradientText>
+                            </h2>
+                            <p className="text-lg md:text-xl text-gray-400 mb-6 md:mb-8 max-w-2xl px-4">
+                              Your career assistant is ready to help you find your 
+                              <GradientText className="ml-2 font-semibold">perfect role</GradientText>
+                            </p>
+                            
+                            <button
+                              type="button"
+                              className="group relative hover:scale-105 hover:bg-blue-700 bg-blue-600 px-8 py-4 md:px-10 md:py-5 text-lg md:text-xl font-bold rounded-xl shadow-lg hover:shadow-xl transition-all duration-300"
+                              onClick={() => startCallWithLoading(modelOverride)}
+                            >
+                              <div className="absolute inset-0 bg-blue-400 rounded-xl animate-pulse group-hover:animate-none opacity-20"></div>
+                              <div className="flex items-center space-x-3">
+                                <span>Start Career Conversation</span>
+                                <svg className="w-5 h-5 md:w-6 md:h-6 transform group-hover:translate-x-1 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                                </svg>
+                              </div>
+                            </button>
+                          </div>
+
+                          <div className="w-full max-w-2xl bg-gray-900 rounded-lg p-4 md:p-6 mb-6 md:mb-8">
+                            <h3 className="text-lg md:text-xl mb-3 md:mb-4">
+                              <GradientText>Let's Find Your Perfect Role</GradientText>
+                            </h3>
+                            <p className="text-gray-400 mb-4 md:mb-6 text-sm md:text-base">{demoConfig.overview}</p>
+                            <div className="bg-gray-800 p-4 md:p-6 rounded-lg border-l-4 border-blue-400">
+                              <p className="font-semibold mb-3 md:mb-4">
+                                <GradientText
+                                  from="from-blue-300"
+                                  via="via-indigo-300"
+                                  to="to-purple-300"
+                                >
+                                  Ready to discuss:
+                                </GradientText>
+                              </p>
+                              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 md:gap-4">
+                                <div className="flex items-start space-x-3 p-3 rounded-lg bg-gray-900/50">
+                                  <Code className="w-5 h-5 text-blue-400 mt-1" />
+                                  <div>
+                                    <h4 className="font-semibold text-blue-300">Skills & Experience</h4>
+                                    <p className="text-xs md:text-sm text-gray-400">Share your technical expertise</p>
+                                  </div>
+                                </div>
+                                <div className="flex items-start space-x-3 p-3 rounded-lg bg-gray-900/50">
+                                  <Briefcase className="w-5 h-5 text-blue-400 mt-1" />
+                                  <div>
+                                    <h4 className="font-semibold text-blue-300">Career Goals</h4>
+                                    <p className="text-xs md:text-sm text-gray-400">Define your career objectives</p>
+                                  </div>
+                                </div>
+                                <div className="flex items-start space-x-3 p-3 rounded-lg bg-gray-900/50">
+                                  <MapPin className="w-5 h-5 text-blue-400 mt-1" />
+                                  <div>
+                                    <h4 className="font-semibold text-blue-300">Location</h4>
+                                    <p className="text-xs md:text-sm text-gray-400">Specify work preferences</p>
+                                  </div>
+                                </div>
+                                <div className="flex items-start space-x-3 p-3 rounded-lg bg-gray-900/50">
+                                  <Building className="w-5 h-5 text-blue-400 mt-1" />
+                                  <div>
+                                    <h4 className="font-semibold text-blue-300">Industries</h4>
+                                    <p className="text-xs md:text-sm text-gray-400">Explore opportunities</p>
+                                  </div>
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                  <CallStatus status={agentStatus}>
+                    <JobProfile />
+                  </CallStatus>
+                </div>
+              </div>
+              {showSummary && latestProfile && !isCallActive && (
+                <div className="fixed inset-0 bg-black/90 backdrop-blur-sm z-50 overflow-y-auto fade-in">
+                  <div className="min-h-screen px-4 py-8 md:py-12 flex items-center justify-center">
+                    <div className="relative w-full max-w-5xl">
+                      <div className="sticky top-4 flex justify-end mb-4 fade-in-up delay-100">
+                        <button
+                          onClick={() => setShowSummary(false)}
+                          className="bg-gray-800/50 hover:bg-gray-700/50 text-gray-300 hover:text-white px-3 py-2 md:px-4 md:py-2 rounded-full flex items-center transition-all duration-300"
+                        >
+                          <span className="mr-2">Close Summary</span>
+                          <XCircle size={18} />
+                        </button>
+                      </div>
+                      <div className="bg-black/50 rounded-xl p-4 md:p-6 fade-in-up delay-200">
+                        <ConversationSummary 
+                          profile={latestProfile}
+                          onSearchJobs={handleSearchJobs}
+                          isSearchingJobs={isSearchingJobs}
+                          jobResults={jobResults}
+                          jobSearchError={jobSearchError}
+                        />
+                        {(isSearchingJobs || jobResults.length > 0 || jobSearchError) && (
+                          <JobSearchResults
+                            isSearching={isSearchingJobs}
+                            results={jobResults}
+                            error={jobSearchError}
+                          />
+                        )}
+                      </div>
+                      <div className="text-center mt-6 md:mt-8 text-gray-400 fade-in-up delay-300">
+                        <p className="text-sm md:text-base">Thank you for using JobeasyO! We hope this conversation was helpful.</p>
+                        <p className="mt-2 text-sm md:text-base">Feel free to start another conversation anytime.</p>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          </>
+        )}
+      </SearchParamsHandler>
+      </Suspense>
+    </>
+  );
+}
